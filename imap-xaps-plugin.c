@@ -36,6 +36,7 @@
 #include "mail-storage-private.h"
 #include "mail-namespace.h"
 #include "mailbox-list-private.h"
+#include "json-parser.h"
 
 #include "imap-xaps-plugin.h"
 
@@ -54,47 +55,32 @@ static imap_client_created_func_t *next_hook_client_created;
 
 
 /**
- * Quote and escape a string. Not sure if this deals correctly with
- * unicode in mailbox names.
- */
-
-static void xaps_str_append_quoted(string_t *dest, const char *str)
-{
-  str_append_c(dest, '"');
-  str_append(dest, str_escape(str));
-  str_append_c(dest, '"');
-}
-
-
-/**
  * Send a registration request to the daemon, which will do all the
  * hard work.
  */
 
-static int xaps_register(const char *socket_path, const char *aps_account_id, const char *aps_device_token, const char *aps_subtopic, const char *dovecot_username, const struct imap_arg *dovecot_mailboxes, string_t *aps_topic)
+static int xaps_register(const char *aps_account_id, const char *aps_device_token, const char *aps_subtopic, const char *dovecot_username, const struct imap_arg *dovecot_mailboxes)
 {
-  int ret = -1;
-
   /*
    * Construct our request.
    */
 
-  string_t *req = t_str_new(1024);
-  str_append(req, "REGISTER");
-  str_append(req, " aps-account-id=");
-  xaps_str_append_quoted(req, aps_account_id);
-  str_append(req, "\taps-device-token=");
-  xaps_str_append_quoted(req, aps_device_token);
-  str_append(req, "\taps-subtopic=");
-  xaps_str_append_quoted(req, aps_subtopic);
-  str_append(req, "\tdovecot-username=");
-  xaps_str_append_quoted(req, dovecot_username);
-  str_append(req, "");
+  string_t *req = t_str_new(2048);
+  str_append(req, "XAPS REGISTER ");
+  str_append(req, "{\"aps-account-id\":\"");
+  json_append_escaped(req, aps_account_id);
+  str_append(req, "\",\"aps-device-token\":\"");
+  json_append_escaped(req, aps_device_token);
+  str_append(req, "\",\"aps-subtopic\":\"");
+  json_append_escaped(req, aps_subtopic);
+  str_append(req, "\",\"dovecot-username\":\"");
+  json_append_escaped(req, dovecot_username);
+  str_append(req, "\",");
 
   if (dovecot_mailboxes == NULL) {
-    str_append(req, "\tdovecot-mailboxes=(\"INBOX\")");
+    str_append(req, "\"dovecot-mailboxes\":[\"INBOX\"]");
   } else {
-    str_append(req, "\tdovecot-mailboxes=(");
+    str_append(req, "\"dovecot-mailboxes\":[");
     int next = 0;
     for (; !IMAP_ARG_IS_EOL(dovecot_mailboxes); dovecot_mailboxes++) {
       const char *mailbox;
@@ -104,53 +90,16 @@ static int xaps_register(const char *socket_path, const char *aps_account_id, co
       if (next) {
         str_append(req, ",");
       }
-      xaps_str_append_quoted(req, mailbox);
+      str_append(req, "\"");
+      json_append_escaped(req, mailbox);
+      str_append(req, "\"");
       next = 1;
     }
-    str_append(req, ")");
+    str_append(req, "]");
   }
-  str_append(req, "\r\n");
-
-  /*
-   * Send the request to our daemon over a unix domain socket. The
-   * protocol is very simple line based. We use an alarm to make sure
-   * this request does not hang.
-   */
-
-  int fd = net_connect_unix(socket_path);
-  if (fd == -1) {
-    i_error("net_connect_unix(%s) failed: %m", socket_path);
-    return -1;
-  }
-
-  net_set_nonblock(fd, FALSE);
-
-  alarm(2);
-  {
-    if (net_transmit(fd, str_data(req), str_len(req)) < 0) {
-      i_error("write(%s) failed: %m", socket_path);
-      ret = -1;
-    } else {
-      char res[1024];
-      ret = net_receive(fd, res, sizeof(res)-1);
-      if (ret < 0) {
-        i_error("read(%s) failed: %m", socket_path);
-      } else {
-        res[ret] = '\0';
-        if (strncmp(res, "OK ", 3) == 0) {
-          char *tmp;
-          /* Remove whitespace the end. We expect \r\n. TODO: Looks shady. Is there a dovecot library function for this? */
-          str_append(aps_topic, strtok_r(&res[3], "\r\n", &tmp));
-          ret = 0;
-        }
-      }
-    }
-  }
-  alarm(0);
-
-  net_disconnect(fd);
-
-  return ret;
+  str_append(req, "}");
+  i_info(str_c(req));
+  return 0;
 }
 
 
@@ -282,15 +231,11 @@ static bool cmd_xapplepushservice(struct client_command_context *cmd)
   struct client *client = cmd->client;
   struct mail_user *user = client->user;
 
-  const char *socket_path = mail_user_plugin_getenv(user, "xaps_socket");
-  if (socket_path == NULL) {
-    socket_path = "/var/run/dovecot/xapsd.sock";
-  }
+  const char *aps_topic = mail_user_plugin_getenv(user, "xaps_topic");
 
-  string_t *aps_topic = t_str_new(0);
-
-  if (xaps_register(socket_path, aps_account_id, aps_device_token, aps_subtopic, user->username, mailboxes, aps_topic) != 0) {
+  if (xaps_register(aps_account_id, aps_device_token, aps_subtopic, user->username, mailboxes) != 0) {
     client_send_command_error(cmd, "Registration failed.");
+i_info("Registration failed.");
     return FALSE;
   }
 
@@ -298,10 +243,10 @@ static bool cmd_xapplepushservice(struct client_command_context *cmd)
    * Return success. We assume that aps_version and aps_topic do not
    * contain anything that needs to be escaped.
    */
-
   client_send_line(cmd->client,
-    t_strdup_printf("* XAPPLEPUSHSERVICE aps-version \"%s\" aps-topic \"%s\"", aps_version, str_c(aps_topic)));
+    t_strdup_printf("* XAPPLEPUSHSERVICE aps-version \"%s\" aps-topic \"%s\"", aps_version, aps_topic));
   client_send_tagline(cmd, "OK XAPPLEPUSHSERVICE Registration successful.");
+
 
   return TRUE;
 }

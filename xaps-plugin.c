@@ -36,6 +36,7 @@
 #include "mail-user.h"
 #include "notify-plugin.h"
 #include "module-context.h"
+#include "json-parser.h"
 
 #include "xaps-plugin.h"
 
@@ -60,18 +61,6 @@ static MODULE_CONTEXT_DEFINE_INIT(xaps_storage_module, &mail_storage_module_regi
 
 
 /**
- * Quote and escape a string. Not sure if this deals correctly with
- * unicode in mailbox names.
- */
-
-static void xaps_str_append_quoted(string_t *dest, const char *str)
-{
-  str_append_c(dest, '"');
-  str_append(dest, str_escape(str));
-  str_append_c(dest, '"');
-}
-
-/**
  * Notify the backend daemon of an incoming mail. Right now we tell
  * the daemon the username and the mailbox in which a new email was
  * posted. The daemon can then lookup the user and see if any of the
@@ -80,57 +69,21 @@ static void xaps_str_append_quoted(string_t *dest, const char *str)
 
 static int xaps_notify(const char *socket_path, const char *username, const char *mailbox)
 {
-  int ret = -1;
-
   /*
    * Construct the request.
    */
 
-  string_t *req = t_str_new(1024);
-  str_append(req, "NOTIFY");
-  str_append(req, " dovecot-username=");
-  xaps_str_append_quoted(req, username);
-  str_append(req, "\tdovecot-mailbox=");
-  xaps_str_append_quoted(req, mailbox);
-  str_append(req, "\r\n");
+  string_t *req = t_str_new(2048);
+  str_append(req, "XAPS NOTIFY ");
+  str_append(req, "{\"dovecot-username\":\"");
+  json_append_escaped(req, username);
+  str_append(req, "\",\"dovecot-mailbox\":\"");
+  json_append_escaped(req, mailbox);
+  str_append(req, "\"}");
 
-  /*
-   * Send the request to our daemon over a unix domain socket. The
-   * protocol is very simple line based. We use an alarm to make sure
-   * this request does not hang.
-   */
+  i_info(str_c(req));
 
-  int fd = net_connect_unix(socket_path);
-  if (fd == -1) {
-    i_error("net_connect_unix(%s) failed: %m", socket_path);
-    return -1;
-  }
-
-  net_set_nonblock(fd, FALSE);
-
-  alarm(1);                     /* TODO: Should be a constant. What is a good duration? */
-  {
-    if (net_transmit(fd, str_data(req), str_len(req)) < 0) {
-      i_error("write(%s) failed: %m", socket_path);
-      ret = -1;
-    } else {
-      char res[1024];
-      ret = net_receive(fd, res, sizeof(res)-1);
-      if (ret < 0) {
-        i_error("read(%s) failed: %m", socket_path);
-      } else {
-        res[ret] = '\0';
-        if (strncmp(res, "OK ", 3) == 0) {
-          ret = 0;
-        }
-      }
-    }
-  }
-  alarm(0);
-
-  net_disconnect(fd);
-
-  return ret;
+  return 0;
 }
 
 
@@ -142,7 +95,7 @@ struct xaps_mailbox {
 
 static struct mailbox_transaction_context *xaps_transaction_begin(struct mailbox *box, enum mailbox_transaction_flags flags)
 {
-  i_debug("xaps_transaction_begin");
+  //i_debug("xaps_transaction_begin");
 
   struct xaps_mailbox *xaps_mailbox = XAPS_CONTEXT(box);
   xaps_mailbox->message_count = 0;
@@ -154,7 +107,7 @@ static struct mailbox_transaction_context *xaps_transaction_begin(struct mailbox
 
 static int xaps_save_finish(struct mail_save_context *ctx)
 {
-  i_debug("xaps_save_finish");
+  //i_debug("xaps_save_finish");
 
   struct mailbox_transaction_context *t = ctx->transaction;
   struct xaps_mailbox *xaps_mailbox = XAPS_CONTEXT(t->box);
@@ -170,7 +123,7 @@ static int xaps_save_finish(struct mail_save_context *ctx)
 
 static int xaps_transaction_commit(struct mailbox_transaction_context *t, struct mail_transaction_commit_changes *changes_r)
 {
-  i_debug("xaps_transaction_commit");
+  //i_debug("xaps_transaction_commit");
 
   /*
    * If the message count in this transaction is not zero then we have
@@ -219,12 +172,12 @@ static struct mail_storage_hooks xaps_mail_storage_hooks = {
 
 void xaps_plugin_init(struct module *module)
 {
-  i_debug("xaps_plugin_init");
+  //i_debug("xaps_plugin_init");
   mail_storage_hooks_add(module, &xaps_mail_storage_hooks);
 }
 
 void xaps_plugin_deinit(void)
 {
-  i_debug("xaps_plugin_deinit");
+  //i_debug("xaps_plugin_deinit");
   mail_storage_hooks_remove(&xaps_mail_storage_hooks);
 }
